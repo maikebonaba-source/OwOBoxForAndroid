@@ -1,1 +1,18 @@
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies and Build
+        run: |
+          npm ci
+          npm run build
+          tar -czvf dist.tar.gz dist/
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release
+        run: |
+          cargo build --release
+          tar -czvf app-linux-amd64.tar.gz target/release/你的程序名
