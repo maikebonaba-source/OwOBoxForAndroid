@@ -18,16 +18,20 @@ public class BalancerBean extends InternalBean {
     public static final int TYPE_LIST = 0;
     public static final int TYPE_GROUP = 1;
 
-    public static final String STRATEGY_RANDOM = "random";
     public static final String STRATEGY_LEAST_PING = "leastPing";
     public static final String STRATEGY_LEAST_LOAD = "leastLoad";
+    public static final String STRATEGY_RANDOM = "random";
+    public static final String STRATEGY_ROUND_ROBIN = "roundRobin";
+    public static final String STRATEGY_ROUND_ROBIN_LEGACY = "round_robin";
+    public static final String STRATEGY_FAILOVER = "failover";
+    public static final String STRATEGY_STABLE = "stable";
     public static final String STRATEGY_CONSISTENT_HASH = "consistent_hash";
 
     public int balancerType = TYPE_LIST; // 0 = list, 1 = group
     public long targetGroupId = 0L;
     public List<Long> targetGroupIds = new ArrayList<>();
     public List<Long> proxies = new ArrayList<>();
-    public String strategy = STRATEGY_RANDOM;
+    public String strategy = STRATEGY_LEAST_PING;
     public String testUrl = "";
     public int interval = 300;
     public int tolerance = 300;
@@ -63,13 +67,30 @@ public class BalancerBean extends InternalBean {
 
     @Override
     public String displayAddress() {
-        String stratStr = strategy != null ? strategy : STRATEGY_RANDOM;
+        String stratName;
+        if (STRATEGY_LEAST_PING.equals(strategy)) {
+            stratName = "最低延迟";
+        } else if (STRATEGY_LEAST_LOAD.equals(strategy)) {
+            stratName = "最低负载";
+        } else if (STRATEGY_RANDOM.equals(strategy)) {
+            stratName = "随机选择";
+        } else if (STRATEGY_ROUND_ROBIN.equals(strategy) || STRATEGY_ROUND_ROBIN_LEGACY.equals(strategy)) {
+            stratName = "轮询";
+        } else if (STRATEGY_FAILOVER.equals(strategy)) {
+            stratName = "故障转移";
+        } else if (STRATEGY_STABLE.equals(strategy)) {
+            stratName = "最稳定";
+        } else if (STRATEGY_CONSISTENT_HASH.equals(strategy)) {
+            stratName = "一致性哈希";
+        } else {
+            stratName = strategy != null ? strategy : STRATEGY_LEAST_PING;
+        }
         if (balancerType == TYPE_GROUP) {
             int gCount = targetGroupIds != null && !targetGroupIds.isEmpty() ? targetGroupIds.size() : (targetGroupId > 0 ? 1 : 0);
-            return "[分组 (" + gCount + ")] 策略: " + stratStr;
+            return "[分组 (" + gCount + ")] 策略: " + stratName;
         } else {
             int count = proxies != null ? proxies.size() : 0;
-            return "[列表 (" + count + ")] 策略: " + stratStr;
+            return "[节点 (" + count + ")] 策略: " + stratName;
         }
     }
 
@@ -79,7 +100,7 @@ public class BalancerBean extends InternalBean {
         if (name == null) name = "";
         if (proxies == null) proxies = new ArrayList<>();
         if (targetGroupIds == null) targetGroupIds = new ArrayList<>();
-        if (strategy == null || strategy.isEmpty()) strategy = STRATEGY_RANDOM;
+        if (strategy == null || strategy.isEmpty()) strategy = STRATEGY_LEAST_PING;
         if (testUrl == null) testUrl = "";
         if (interval <= 0) interval = 300;
         if (tolerance < 0) tolerance = 300;

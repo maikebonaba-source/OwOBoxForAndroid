@@ -82,7 +82,13 @@ class BalancerSettingsActivity : ProfileSettingsActivity<BalancerBean>(R.layout.
         } else emptyList()
         DataStore.balancerTargetGroups = gids.joinToString(",")
         DataStore.balancerTargetGroup = gids.firstOrNull() ?: 0L
-        DataStore.balancerStrategy = strategy
+        DataStore.balancerStrategy = when (strategy) {
+            "round_robin" -> BalancerBean.STRATEGY_ROUND_ROBIN
+            "failover", "stable" -> BalancerBean.STRATEGY_LEAST_PING
+            "consistent_hash" -> BalancerBean.STRATEGY_ROUND_ROBIN
+            null, "" -> BalancerBean.STRATEGY_LEAST_PING
+            else -> strategy
+        }
         DataStore.balancerTestUrl = testUrl
         DataStore.balancerInterval = interval
         DataStore.balancerTolerance = tolerance
@@ -275,11 +281,13 @@ class BalancerSettingsActivity : ProfileSettingsActivity<BalancerBean>(R.layout.
         val tolerancePref = findPreference<EditTextPreference>("balancerTolerance")
         val toleranceUnitPref = findPreference<SimpleMenuPreference>("balancerToleranceUnit")
 
-        // Strategy-based visibility: hide tolerance prefs when strategy is leastLoad
+        // Strategy-based visibility: only leastPing uses tolerance / url / interval probe settings
         fun updateStrategyVisibility(strategy: String) {
-            val showTolerance = strategy != BalancerBean.STRATEGY_LEAST_LOAD
-            tolerancePref?.isVisible = showTolerance
-            toleranceUnitPref?.isVisible = showTolerance
+            val isLeastPing = strategy == BalancerBean.STRATEGY_LEAST_PING
+            tolerancePref?.isVisible = isLeastPing
+            toleranceUnitPref?.isVisible = isLeastPing
+            urlPref?.isVisible = isLeastPing
+            intervalPref?.isVisible = isLeastPing
         }
 
         fun updateToleranceSummary() {
@@ -296,8 +304,9 @@ class BalancerSettingsActivity : ProfileSettingsActivity<BalancerBean>(R.layout.
         updateStrategyVisibility(DataStore.balancerStrategy)
 
         val strategyPref = findPreference<SimpleMenuPreference>("balancerStrategy")
+        strategyPref?.value = DataStore.balancerStrategy
         strategyPref?.setOnPreferenceChangeListener { _, newValue ->
-            val strategy = (newValue as? String) ?: BalancerBean.STRATEGY_RANDOM
+            val strategy = (newValue as? String) ?: BalancerBean.STRATEGY_LEAST_PING
             DataStore.balancerStrategy = strategy
             updateStrategyVisibility(strategy)
             true
@@ -479,27 +488,61 @@ class BalancerSettingsActivity : ProfileSettingsActivity<BalancerBean>(R.layout.
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == Activity.RESULT_OK) runOnDefaultDispatcher {
                 DataStore.dirty = true
-
-                val profile = ProfileManager.getProfile(
-                    result.data!!.getLongExtra(
-                        ProfileSelectActivity.EXTRA_PROFILE_ID, 0
-                    )
-                )!!
-
-                if (!testProfileAllowed(profile)) {
+                val data = result.data ?: return@runOnDefaultDispatcher
+                val multiIds = data.getLongArrayExtra(ProfileSelectActivity.EXTRA_PROFILE_IDS)
+                if (multiIds != null) {
+                    val profiles = ProfileManager.getProfiles(multiIds.toList()).associateBy { it.id }
+                    var circularFound = false
+                    val newProxyList = ArrayList<ProxyEntity>()
+                    val seen = HashSet<Long>()
+                    for (id in multiIds) {
+                        if (seen.add(id)) {
+                            val p = profiles[id] ?: continue
+                            if (!testProfileAllowed(p)) {
+                                circularFound = true
+                                continue
+                            }
+                            newProxyList.add(p)
+                        }
+                    }
                     onMainDispatcher {
-                        MaterialAlertDialogBuilder(this@BalancerSettingsActivity).setTitle(R.string.circular_reference)
-                            .setMessage(R.string.circular_reference_sum)
-                            .setPositiveButton(android.R.string.ok, null).show()
+                        if (circularFound) {
+                            MaterialAlertDialogBuilder(this@BalancerSettingsActivity)
+                                .setTitle(R.string.circular_reference)
+                                .setMessage(R.string.circular_reference_sum)
+                                .setPositiveButton(android.R.string.ok, null)
+                                .show()
+                        }
+                        proxyList.clear()
+                        proxyList.addAll(newProxyList)
+                        configurationAdapter.notifyDataSetChanged()
                     }
                 } else {
-                    configurationList.post {
-                        if (replacing != 0) {
-                            proxyList[replacing - 1] = profile
-                            configurationAdapter.notifyItemChanged(replacing)
-                        } else {
-                            proxyList.add(profile)
-                            configurationAdapter.notifyItemInserted(proxyList.size)
+                    val singleId = data.getLongExtra(ProfileSelectActivity.EXTRA_PROFILE_ID, 0L)
+                    if (singleId > 0L) {
+                        val profile = ProfileManager.getProfile(singleId)
+                        if (profile != null) {
+                            if (!testProfileAllowed(profile)) {
+                                onMainDispatcher {
+                                    MaterialAlertDialogBuilder(this@BalancerSettingsActivity)
+                                        .setTitle(R.string.circular_reference)
+                                        .setMessage(R.string.circular_reference_sum)
+                                        .setPositiveButton(android.R.string.ok, null)
+                                        .show()
+                                }
+                            } else {
+                                onMainDispatcher {
+                                    if (replacing != 0 && replacing <= proxyList.size) {
+                                        proxyList[replacing - 1] = profile
+                                        configurationAdapter.notifyItemChanged(replacing)
+                                    } else {
+                                        if (proxyList.none { it.id == profile.id }) {
+                                            proxyList.add(profile)
+                                            configurationAdapter.notifyItemInserted(proxyList.size)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -511,10 +554,24 @@ class BalancerSettingsActivity : ProfileSettingsActivity<BalancerBean>(R.layout.
         fun bind() {
             binding.root.setOnClickListener {
                 replacing = 0
+                val excludeList = mutableListOf<Long>()
+                if (DataStore.editingId > 0L) excludeList.add(DataStore.editingId)
+                if (DataStore.balancerFrontProxy > 0L) excludeList.add(DataStore.balancerFrontProxy)
+                if (DataStore.balancerLandingProxy > 0L) excludeList.add(DataStore.balancerLandingProxy)
+
                 selectProfileForAdd.launch(
                     Intent(
                         this@BalancerSettingsActivity, ProfileSelectActivity::class.java
-                    )
+                    ).apply {
+                        putExtra(ProfileSelectActivity.EXTRA_MULTI_SELECT, true)
+                        putExtra(
+                            ProfileSelectActivity.EXTRA_SELECTED_IDS,
+                            proxyList.map { it.id }.toLongArray()
+                        )
+                        if (excludeList.isNotEmpty()) {
+                            putExtra(ProfileSelectActivity.EXTRA_EXCLUDE_IDS, excludeList.toLongArray())
+                        }
+                    }
                 )
             }
         }

@@ -37,6 +37,8 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isGone
 import androidx.core.view.isVisible
 import androidx.core.view.size
+import androidx.core.view.GravityCompat
+import androidx.core.widget.addTextChangedListener
 import io.nekohasekai.sagernet.utils.Theme
 import kotlinx.coroutines.delay
 import androidx.fragment.app.Fragment
@@ -157,7 +159,12 @@ import io.nekohasekai.sagernet.database.SubscriptionBean
 import kotlin.math.abs
 
 class ConfigurationFragment @JvmOverloads constructor(
-    val select: Boolean = false, val selectedItem: ProxyEntity? = null, val titleRes: Int = 0
+    val select: Boolean = false,
+    val selectedItem: ProxyEntity? = null,
+    val titleRes: Int = 0,
+    val multiSelect: Boolean = false,
+    val initialSelectedIds: LongArray? = null,
+    val excludedIds: LongArray? = null
 ) : ToolbarFragment(R.layout.layout_group_list),
     PopupMenu.OnMenuItemClickListener,
     Toolbar.OnMenuItemClickListener,
@@ -166,6 +173,7 @@ class ConfigurationFragment @JvmOverloads constructor(
 
     interface SelectCallback {
         fun returnProfile(profileId: Long)
+        fun onProfileToggled(profileId: Long, isSelected: Boolean, totalSelected: Int) {}
     }
 
     companion object {
@@ -178,6 +186,33 @@ class ConfigurationFragment @JvmOverloads constructor(
     lateinit var groupPager: ViewPager2
 
     val alwaysShowAddress by lazy { DataStore.alwaysShowAddress }
+
+    val multiSelectedIds = java.util.Collections.synchronizedSet(LinkedHashSet<Long>()).apply {
+        if (initialSelectedIds != null) {
+            addAll(initialSelectedIds.toList())
+        }
+    }
+
+    fun toggleMultiSelected(profileId: Long) {
+        val isNowSelected: Boolean
+        val count: Int
+        synchronized(multiSelectedIds) {
+            if (multiSelectedIds.contains(profileId)) {
+                multiSelectedIds.remove(profileId)
+                isNowSelected = false
+            } else {
+                multiSelectedIds.add(profileId)
+                isNowSelected = true
+            }
+            count = multiSelectedIds.size
+        }
+        if (::adapter.isInitialized) {
+            adapter.groupFragments.values.forEach { fragment ->
+                fragment.adapter?.refreshProfileState(setOf(profileId))
+            }
+        }
+        (activity as? SelectCallback)?.onProfileToggled(profileId, isNowSelected, count)
+    }
 
     @Volatile
     private var selectedProxySnapshot = selectedItem?.id ?: 0L
@@ -285,7 +320,7 @@ class ConfigurationFragment @JvmOverloads constructor(
         }
     }
 
-    private fun isSelectedProfile(profileId: Long) = selectedProxySnapshot == profileId
+    fun isSelectedProfile(profileId: Long) = if (multiSelect) multiSelectedIds.contains(profileId) else selectedProxySnapshot == profileId
 
     private fun isCurrentProfile(profileId: Long) = currentProfileSnapshot == profileId
 
@@ -359,8 +394,28 @@ class ConfigurationFragment @JvmOverloads constructor(
         currentSearchQuery = query
         searchJob?.cancel()
         searchJob = lifecycleScope.launch {
-            delay(150)
-            getCurrentGroupFragment()?.adapter?.filter(query)
+            if (query.isNotBlank()) {
+                delay(180)
+            }
+            val groupFragment = getCurrentGroupFragment() ?: return@launch
+            val adapter = groupFragment.adapter ?: return@launch
+            val trimmed = query.trim()
+            if (trimmed.isEmpty()) {
+                adapter.filter("")
+            } else {
+                val lower = trimmed.lowercase()
+                val matched = withContext(Dispatchers.Default) {
+                    val all = adapter.allConfigurationIdList
+                    val map = adapter.configurationList
+                    all.filter { id ->
+                        val entity = map[id] ?: return@filter false
+                        (entity.displayName()?.lowercase()?.contains(lower) == true) ||
+                                (entity.displayType()?.lowercase()?.contains(lower) == true) ||
+                                (entity.displayAddress()?.lowercase()?.contains(lower) == true)
+                    }
+                }
+                adapter.applyFilterResult(matched)
+            }
             updateToolbarMenuTitles()
         }
         return true
@@ -369,8 +424,30 @@ class ConfigurationFragment @JvmOverloads constructor(
     override fun onQueryTextSubmit(query: String): Boolean {
         currentSearchQuery = query
         searchJob?.cancel()
-        getCurrentGroupFragment()?.adapter?.filter(query)
-        updateToolbarMenuTitles()
+        val groupFragment = getCurrentGroupFragment()
+        val adapter = groupFragment?.adapter
+        if (adapter != null) {
+            val trimmed = query.trim()
+            if (trimmed.isEmpty()) {
+                adapter.filter("")
+            } else {
+                val lower = trimmed.lowercase()
+                lifecycleScope.launch {
+                    val matched = withContext(Dispatchers.Default) {
+                        val all = adapter.allConfigurationIdList
+                        val map = adapter.configurationList
+                        all.filter { id ->
+                            val entity = map[id] ?: return@filter false
+                            (entity.displayName()?.lowercase()?.contains(lower) == true) ||
+                                    (entity.displayType()?.lowercase()?.contains(lower) == true) ||
+                                    (entity.displayAddress()?.lowercase()?.contains(lower) == true)
+                        }
+                    }
+                    adapter.applyFilterResult(matched)
+                    updateToolbarMenuTitles()
+                }
+            }
+        }
         return true
     }
 
@@ -447,6 +524,10 @@ class ConfigurationFragment @JvmOverloads constructor(
 
     private fun updateSearchMaxWidth(searchView: SearchView) {
         if (!isToolbarInitialized) return
+        if (searchView.isIconified) {
+            searchView.maxWidth = dp2px(48)
+            return
+        }
         val tbWidth = toolbar.width
         if (tbWidth > 0) {
             val maxW = (tbWidth - dp2px(112)).coerceAtLeast(dp2px(160))
@@ -456,6 +537,10 @@ class ConfigurationFragment @JvmOverloads constructor(
         } else {
             toolbar.post {
                 if (isAdded && !isDetached && isToolbarInitialized) {
+                    if (searchView.isIconified) {
+                        searchView.maxWidth = dp2px(48)
+                        return@post
+                    }
                     val postW = toolbar.width
                     if (postW > 0) {
                         val maxW = (postW - dp2px(112)).coerceAtLeast(dp2px(160))
@@ -495,23 +580,43 @@ class ConfigurationFragment @JvmOverloads constructor(
         editText?.setHintTextColor(hintColor)
         editText?.imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_FULLSCREEN
 
-        editText?.setOnFocusChangeListener { v, hasFocus ->
+        searchView.setOnQueryTextFocusChangeListener { _, hasFocus ->
             if (hasFocus) {
-                showSoftKeyboard(v)
+                showSoftKeyboard(editText)
             }
         }
         editText?.setOnClickListener {
             showSoftKeyboard(editText)
         }
-        searchView.setOnClickListener {
-            if (searchView.isIconified) {
-                searchView.isIconified = false
-            }
-            showSoftKeyboard(editText)
-        }
 
         val closeBtn = searchView.findViewById<ImageView>(androidx.appcompat.R.id.search_close_btn)
         closeBtn?.setColorFilter(textColor)
+
+        // Ensure close button stays visible while search is active
+        editText?.addTextChangedListener {
+            if (!searchView.isIconified) {
+                closeBtn?.visibility = View.VISIBLE
+            }
+        }
+
+        closeBtn?.setOnClickListener {
+            val text = editText?.text?.toString().orEmpty()
+            if (text.isNotEmpty()) {
+                editText?.setText("")
+                currentSearchQuery = ""
+                searchJob?.cancel()
+                getCurrentGroupFragment()?.adapter?.filter("")
+                updateToolbarMenuTitles()
+                closeBtn.post {
+                    if (!searchView.isIconified) {
+                        closeBtn.visibility = View.VISIBLE
+                    }
+                }
+            } else {
+                cancelSearch(searchView)
+            }
+        }
+
         val searchBtn = searchView.findViewById<ImageView>(androidx.appcompat.R.id.search_button)
         searchBtn?.setColorFilter(textColor)
         val magBtn = searchView.findViewById<ImageView>(androidx.appcompat.R.id.search_mag_icon)
@@ -648,13 +753,37 @@ class ConfigurationFragment @JvmOverloads constructor(
                 toolbar.title = ""
                 updateSearchMaxWidth(searchView)
                 updateToolbarMenuTitles()
+
+                // Show back navigation arrow on the toolbar for clear exit path
+                if (!select) {
+                    toolbar.setNavigationIcon(R.drawable.baseline_arrow_back_24)
+                    val primaryColor = when {
+                        Theme.isWhiteTheme() -> Color.parseColor("#212121")
+                        Theme.isLightGrayTheme() -> Color.parseColor("#1F2937")
+                        Theme.isBlackTheme() -> Color.WHITE
+                        else -> requireContext().getColorAttr(android.R.attr.textColorPrimary)
+                    }
+                    toolbar.navigationIcon?.let {
+                        val tinted = it.mutate()
+                        DrawableCompat.setTint(tinted, primaryColor)
+                        toolbar.navigationIcon = tinted
+                    }
+                    toolbar.setNavigationOnClickListener {
+                        cancelSearch(searchView)
+                    }
+                }
+
                 val editText = searchView.findViewById<SearchView.SearchAutoComplete>(androidx.appcompat.R.id.search_src_text)
+                val closeBtn = searchView.findViewById<ImageView>(androidx.appcompat.R.id.search_close_btn)
+                closeBtn?.visibility = View.VISIBLE
                 showSoftKeyboard(editText)
             }
 
             searchView.setOnCloseListener {
-                cancelSearch(searchView)
-                true
+                if (!isCancelingSearch) {
+                    cancelSearch(searchView)
+                }
+                false
             }
         }
 
@@ -665,9 +794,13 @@ class ConfigurationFragment @JvmOverloads constructor(
                 val sItem = toolbar.menu.findItem(R.id.action_search)
                 val sv = (sItem?.actionView as? SearchView) ?: toolbar.findViewById<SearchView>(R.id.action_search)
                 if (sv != null) {
-                    val targetW = (newWidth - dp2px(112)).coerceAtLeast(dp2px(160))
-                    if (sv.maxWidth != targetW) {
-                        sv.maxWidth = targetW
+                    if (!sv.isIconified) {
+                        val targetW = (newWidth - dp2px(112)).coerceAtLeast(dp2px(160))
+                        if (sv.maxWidth != targetW) {
+                            sv.maxWidth = targetW
+                        }
+                    } else {
+                        sv.maxWidth = dp2px(48)
                     }
                 }
             }
@@ -3007,6 +3140,12 @@ class ConfigurationFragment @JvmOverloads constructor(
 
             private val updated = HashSet<ProxyEntity>()
 
+            fun applyFilterResult(matched: List<Long>) {
+                configurationIdList.clear()
+                configurationIdList.addAll(matched)
+                notifyDataSetChanged()
+            }
+
             fun filter(name: String) {
                 val query = name.trim()
                 if (query.isEmpty()) {
@@ -3266,6 +3405,11 @@ class ConfigurationFragment @JvmOverloads constructor(
                 } else {
                     SagerDatabase.proxyDao.getByGroup(proxyGroup.id)
                 }
+                val pf = parentFragment as? ConfigurationFragment
+                if (pf?.excludedIds != null && pf.excludedIds.isNotEmpty()) {
+                    val excludeSet = pf.excludedIds.toSet()
+                    newProfiles = newProfiles.filter { it.id !in excludeSet }
+                }
                 val currentOrder = if (isAllGroupsTab) DataStore.allGroupsOrder else proxyGroup.order
                 when (currentOrder) {
                     GroupOrder.ORIGIN -> {
@@ -3307,8 +3451,15 @@ class ConfigurationFragment @JvmOverloads constructor(
                 var selectedProfileIndex = -1
 
                 if (selected) {
-                    val selectedProxy = selectedItem?.id ?: DataStore.selectedProxy
-                    selectedProfileIndex = newProfileIds.indexOf(selectedProxy)
+                    if (pf?.multiSelect == true) {
+                        val firstSelected = pf.multiSelectedIds.firstOrNull()
+                        if (firstSelected != null) {
+                            selectedProfileIndex = newProfileIds.indexOf(firstSelected)
+                        }
+                    } else {
+                        val selectedProxy = selectedItem?.id ?: DataStore.selectedProxy
+                        selectedProfileIndex = newProfileIds.indexOf(selectedProxy)
+                    }
                 }
 
                 configurationListView.post {
@@ -3398,7 +3549,12 @@ class ConfigurationFragment @JvmOverloads constructor(
                     if (DataStore.hapticFeedback) it.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     val proxyEntity = entity
                     if (select) {
-                        (requireActivity() as SelectCallback).returnProfile(proxyEntity.id)
+                        val pf = parentFragment as? ConfigurationFragment
+                        if (pf?.multiSelect == true) {
+                            pf.toggleMultiSelected(proxyEntity.id)
+                        } else {
+                            (requireActivity() as SelectCallback).returnProfile(proxyEntity.id)
+                        }
                     } else {
                         selectProfile(proxyEntity)
                     }
@@ -3883,14 +4039,44 @@ class ConfigurationFragment @JvmOverloads constructor(
             currentSearchQuery = ""
             searchJob?.cancel()
             getCurrentGroupFragment()?.adapter?.filter("")
+
+            searchView.setQuery("", false)
+            searchView.onActionViewCollapsed()
+            val searchItem = toolbar.menu.findItem(R.id.action_search)
+            searchItem?.collapseActionView()
+            searchView.clearFocus()
+            searchView.maxWidth = dp2px(48)
+
             toolbar.menu.findItem(R.id.action_add)?.isVisible = true
             toolbar.title = getString(R.string.app_name)
-            searchView.setQuery("", false)
-            if (!searchView.isIconified) {
-                searchView.isIconified = true
+
+            val primaryColor = when {
+                Theme.isWhiteTheme() -> Color.parseColor("#212121")
+                Theme.isLightGrayTheme() -> Color.parseColor("#1F2937")
+                Theme.isBlackTheme() -> Color.WHITE
+                else -> requireContext().getColorAttr(android.R.attr.textColorPrimary)
             }
-            searchView.clearFocus()
+
+            if (!select) {
+                toolbar.setNavigationIcon(R.drawable.ic_navigation_menu)
+                toolbar.navigationIcon?.let {
+                    val tinted = it.mutate()
+                    DrawableCompat.setTint(tinted, primaryColor)
+                    toolbar.navigationIcon = tinted
+                }
+                toolbar.setNavigationOnClickListener {
+                    (activity as? MainActivity)?.binding?.drawerLayout?.openDrawer(GravityCompat.START)
+                }
+            }
+
+            tintMenuIcons(toolbar.menu, primaryColor)
+
+            val imm = requireContext().getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(searchView.windowToken, 0)
             updateToolbarMenuTitles()
+            toolbar.post {
+                toolbar.requestLayout()
+            }
         } finally {
             isCancelingSearch = false
         }

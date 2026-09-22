@@ -115,14 +115,13 @@
                     android:textColor="?android:textColorSecondary" />
 
                 <TextView
-                    android:layout_marginTop="4dp"
-                    android:layout_marginBottom="12dp"
                     android:id="@+id/route_outbound"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:layout_marginBottom="8dp"
                     android:textAppearance="?android:attr/textAppearanceSmall"
                     android:textColor="?android:textColorSecondary" />
-
             </LinearLayout>
 
             <androidx.appcompat.widget.SwitchCompat
